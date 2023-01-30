@@ -1,0 +1,1 @@
+# Optimizing with Adaptive Query Execution and Dynamic Partition Pruning

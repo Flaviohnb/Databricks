@@ -1,0 +1,289 @@
+Spark Optimization
+
+|| 5 problemas de performance comuns:
+
+| Categorias
+. Spill: A gravação de arquivos temporários em disco devido à falta de memória;
+. Skew: Um desequilíbrio no tamanho das partições;
+. Shuffle: O ato de mover dados entre executores;
+. Storage: : Um conjunto de problemas diretamente relacionados à forma como os dados são armazenados em disco;
+. Serialization: A distribuição de segmentos de código no cluster;
+
+|| Benchmarking 
+ 
+| Geralmente, existem três abordagens comuns para benchmarking:
+. count() action;
+. foreach() action with a do-nothing lambda;
+. noop(or no operation) write;
+
+| Podemos visualizar como essas 3 estrategias diferem com o "Spark UI Simulator" - databricks.training/spark-ui-simulator
+. Exemplo 5980 - Spark UI Simulator:
+    . "B-1" e "B-2", no tempo de execucao se dá por conta do B-2 já ter o schema na memoria enquanto no B-1 o schema está sendo gravado pela primeira vez;
+    . "C-S" e "C-P", independente da linguagem utilizada, praticamente nao há diferenca na execucao. O comando ".read.schema(schema)" melhora o desempenho em relacao a leitura;
+    . "D-S" e "D-P", evitar ou NAO utilzar foreach;
+    . "E-S" e "E-P", comando ".format("noop")" apenas para verificar os efeitos de salvar em seu armazenamento sem faze-lo corretamente;
+
+| 1 Skew Problem:
+.  Precisamos primeiro entender qual problema estamos resolvendo:
+    . Resolver o problema da RAM é tratar apenas os sintomas e nao a causa raiz;
+    . O problema de RAM se manifesta como erros de derramamento e/ou OOM (Out Of Memory) e nao deve ser a primeira coisa que resolvemos;
+    . O primeiro problema a resolve é a distribuição desigual de registros em todas as particoes que se manifesta como tarefas proporciponalmente mais lentas;
+. Existem várias estratégias para corrigir a Skew:
+    . Empregue uma Databricks-specific skew hint (Skew Join Optimization);
+    . Habilitar Adaptive Query Execution no Spark 3;
+    . Salte a coluna distorcida com um número aleatório criando uma melhor distribuição em cada partição ao custo de processamento extra;
+. Exemplo 1596 - Spark UI Simulator:
+    . Para os passos a seguir perceba:
+        . Numero total de execucoes correspondentes aos comandos, o numero total de tasks. No Spark UI, verifique a saude dos stages dentro do "Event Timeline", o minimo/medio/max "Shuffle Read Size" no "Summary Metrics", o quantidade total de derramamento no "Aggregated Metrics by Executor".
+    . "C" e "D":  Com base no "C - job 6, stage 16" e "D - job 9, stage 23", temos uma distribuicao mais saudavel para o passo "D";
+    . "E", "C" e "D": O comportamento do de distribuicao do Shuffle se mostrou mais saudavel em relacao aos passos "C" e "D", onde o "C" possui um codigo (padrao), o "D" possui a tecnica de (join with skew hint) e o "E" possui o (join with AQE)
+    . "F" Salted-Skew, comparado aos passos anteriores: Houve uma melhora em comparacao ao baseline, mas nao foi melhor que o "D - Skew Hit" ou "E - AQE". 
+    . Em resumo para as solucoes aplicadas ao exemplo #1596, o mais saudavel é o AQE.   
+
+| 2 Spill Problem:
+. Ato de mover um RDD da RAM para o disco e, posteriormente, de volta para a RAM novamente;
+. Isso ocorre quando uma determinada particao é simplesmente grande demais para caber na RAM;
+. Nesse caso, o Spark é forcado a fazer leituras e gravacoes de disco [potencialmente] caras para liberar a RAM local;
+. Tudo isso apenas para evitar o temido erro OOM (Out of Memory);
+. Existem várias maneiras de induzir esse problema:
+    . Definir "spark.sql.files.maxPartitionBytes" com um valor alto (padrao é 128 MB);
+    . Utilizar o "explode()", num pequeno array;
+    . "join()" ou "crossJoin()" de duas tabelas;
+    . Agregando resultados por um recurso distorcido;
+. O Spill é representado por dois valores no Spark UI:
+    . Memory: Para a particao que foi derramada (spilled), este é o tamanho dos dados que existiam na memoria;
+    . Disk: Da mesma forma, para a particao que foi derramada, este é o tamanho dos dados como existiam no disco;
+    . Os valores de Memory e Disk, sao sempre apresentados juntos;
+    . O tamanho do disco sempre será menor devido a compressao natual obtida no ato de serializar esses dados antes de gravá-los no disco;
+. O spill é representado apenas na página de detalhes para um único estágio:
+    . Resumo de Métricas;
+    . Métricas Agregadas por Executor;
+    . A tabela de tarefas;
+    . Quando nao há derramamento, as colunas correspondentes nem aparecem na interface do usuário do Spark, significa que se a coluna estiver lá, há derramada em algum lugar;
+. No exemplo #6518, observamos que:
+    . Como é dificil observar e encontrar o "spill", mesmo com o auxilio do Spark UI;
+    . Como mitigar (depende de situacao a situacao):
+        . Alocar um cluster com mais memoria por worker;
+        . No caso de "skew", resolva a causa raiz primeiro;
+        . Diminua o tamanho de cada particao aumentando o numero de particoes:
+            . Por gerenciar "spark.sql.shuffle.partitions";
+            . Por "repartitigoning" explicitamente;
+            . Gerenciando "spark.sql.files.maxPartitionBytes";
+            . Não é uma estratégia eficaz contra distorções;
+        . Ignore, como no exemplo do passo E:
+            . De ~800 tarefas, apenas ~50 tarefas derramaram;
+            . Sao 6% do seu tempo?
+        . No entando, basta uma longa tarefa para atrasar uma etapa inteira;
+
+| 3 Shuffle:
+. O shuffle (embaralhamento) é um efeito colateral da ampla transformacao:
+    . join(), distinct(), groupBy(), orderBy() e algumas acoes de count(). 
+    . Essas transformacoes possuem direfencas em relacao ao shuffle; 
+        . distinct() agrega muitos registros com base em uma ou mais chaves e reduz todas as duplicatas a um registro;
+        . groupBy()/count() agrega muitos registros com base em uma chave e em seguida retorna um registro que é a contagem dessa chave;
+        . join() pega dois conjuntos de dados, agrega cada um deles por uma chave comum e produz um registro para cada combinacao correspondente;
+        . crossJoin() pega dois conjunto de dados, agrega cada um deles por uma chave comum e produz um registro para cada combinacao possivel; 
+    . Semelhancas:
+        . Leem dados de alguma fonte;
+        . Agregam registros em todas as particoes por alguma chave;
+        . Registros agregados sao gravados em disco;
+        . Cada executor ler o registro agregado dos demais executores;
+        . Requer custo alto de IO de disco e rede;
+. Seja pragmatico, existem alguns casos em que um embaralhamento pode ser evitado ou mitigado:
+    . Dica: nao se preocupe em tentar remover todos os embaralhamentos;
+    . Os embaralhamentos costumam ser um mal necessario;
+    . Foco nas operacoes mais caras;
+    . Muitas operacoes de embaralhamento sao bastante rapidas;
+    . A segmentacao de 'skew', 'spill', pequenos arquivos, muitas vezes rendem melhores retornos;
+    . A maior dificuldade com as operacoes de shuffle é a quantidade de dados que estao sendo embalharados no cluster:
+        . Reduzir o IO da rede usandos menos e maiores trabalhadores;
+        . Reduzir a quantidade de dados sendo embalharados:
+            . Restrinja suas colunas;
+            . Filtre preventivamente registros desnecesários;
+        . Desnormaliza os datasets, principalmente quando o shuffle está enraizado em uma junção;
+. Shuffle Mitigation - BroadcastHashJoins
+    . "spark.sql.autoBroadcastJoinThreshold";
+    . Os casos de uso sao limitados a menos de 10 MB por default;
+    . Para juncoes, pre-embaralhe os dados com um conjunto de dados em bucket;
+    . Eles podem colocar pressao indevida no Driver, resultando em 00Ms;
+    . Em alguns casos, a alternativa SortMergeJoin pode ser mais rápida;
+    . Em geral, o comportamento automático do Spark pode ser sua melhor aposta;
+. BroadcastHashJoins vs SortMergeJoin
+    . BroadcastHashJoins:
+        . [Better] Evite embaralhar o maior lado;
+        . [Better] Lida naturalmente com a distorcao de dados;
+        . [Better] Barato para juncoes seletivas; 
+        . Os dados transmitidos precisam caber na memória;
+        . Nao pode ser usado para certas juncoes externas;
+        . A sobrecarga de E -> D -> E é alta com poucos/grandes executors;
+    . SortMergeJoin:
+        . Embaralha ambos os lados;
+        . Pode sofrer de distorcao de dados;
+        . Pode produzir resultados intermediarios desnecessarios;
+        . [Better] Os dados podem ser derramados e lidos do disco;
+        . [Better] Ele pode ser usado para todas as juncoes;
+        . [Better] Supera BroadcastHashJoins (BHJs) com poucos/grandes executores;
+. Shuffle Mitigation - Bucketing
+    . O objetivo é eliminar a troca e classificação pré-embaralhando os dados;
+    . Os dados são agregados em N buckets e, opcionalmente, classificados [localmente];
+    . O resultado é então salvo em uma tabela e fica disponível para leituras subsequentes;
+    . A operação de bucketing se paga se as duas tabelas forem regularmente unidas e/ou não reduzidas com algum tipo de filtro;
+. Exemplo #6167 - Spark Ui Simulator
+    . Step B/D: Ao utilizar as tabelas salvas em um bucket pela particao "b_city_id", o join obteve uma melhora significativa. 
+. Requisitos para Bucketing:
+    . Para funcionar corretamente, ambas as tabelas devem ter o mesmo numero de "bucket";
+    . Voce deve predeterminar o numero de bucket;
+    . Voce deve ter predeterminado o tamanho inicial da particao Spark;
+        . Apos a ingestao "1 bucket" == "one spark-partition";
+        . Substituir "spark.sql.files.maxPartitionBytes";
+    . O trabalho para produzir e manter é alto;
+    . Bucketing expoe "skew", que deve ser mitigado durante a producao;
+. Quando usar o Bucket ou quando faz sentido:
+    . Com um conjunto de dados de 100 GB, posso carregar todos os dados em dois workers de 488 GB e 64 núcleos;
+    . Com apenas dois workers, o custo de embaralhar é quase inexistente;
+    . A classificacao precisa ser lenta;
+    . E o custo de IO entre executores precisa ser alto;
+    . Em escalas de 1 a 50 terabytes já estamos usando as maiores VMs possiveis com dezenas a centenas de trabalhadores;
+
+| Storage:
+. Tiny Files in Action - Exemplo #8923:
+    . Verificar os pontos abaixos nas etapas B, C e D:
+    . Numero de arquivos lidos;
+    . Tempo total de varredura;
+    . Tempo total de leitura do filesystem;
+    . Tamanho dos arquivos lidos;
+    . Step B: 
+        . Conjunto nao particionado com aproximadamente 41 milhoes de linhas;
+        . 2.84 minutos;
+        . Stage 1 -> Job 1 -> SQL 0: 
+            . Numero de arquivos lidos: 6.273
+            . Tempo de varredura: 20.3 minutos
+            . Tempo de leitura do filesystem: 13.8 minutos
+            . Tamanho dos arquivos lidos: 1209.9 MB
+            . Quantidade de linhas na saida: 41.309.277
+            . Arquivos por hora: 41.309.277 / 0.25 (1/4 de hora) = 165.237.108
+    . Step C: 
+        . Conjunto nao particionado com aproximadamente 2.7 bilhoes de linhas;
+        . 10.22 minutos;
+        . Stage 3 -> Job 3 -> SQL 1: 
+            . Numero de arquivos lidos: 100
+            . Tempo de varredura: 59.7 minutos
+            . Tempo de leitura do filesystem: 50.6 minutos
+            . Tamanho dos arquivos lidos: 102.7 GB
+            . Quantidade de linhas na saida: 2.687.821.474
+            . Arquivos por hora: 2.687.821.474 / 1 = 2.687.821.474
+    . Step D: 
+        . Conjunto nao particionado com aproximadamente 34 milhoes de linhas;
+        . 1.53 horas;
+        . Stage 5 -> Job 5 -> SQL 2: 
+            . Numero de arquivos lidos: 345.612
+            . Tempo de varredura: 12.02 horas
+            . Tempo de leitura do filesystem: 6.56 horas
+            . Tamanho dos arquivos lidos: 2.1 GB
+            . Quantidade de linhas na saida: 34.562.416
+            . Arquivos por hora: 34.562.416 / 6.56 = 5.268.660
+    . Em resumo temos um problema de spill na etapa D;
+. Storage - Directory Scanning:
+    . Está é a ideia:
+        . Pode-se listar os arquivos em um único diretório;
+        . Uma única lista com milhares de arquivos ainda está OK;
+        . A verificacao ainda nao é tao ruim quanto a sobrecarga da leitur de arquivos minusculos;
+    . Conjuntos de dados altamente partitionados (dados em disco):
+        . Para cada particao de disco existe outro diretorio para escanear;
+        . Multiplique esse número de diretorios por N particoes secundarias e M terciarias;
+        . Estes devem ser verificados pelo driver um diretorio por vez;
+    . Exemplo #8973:
+        . Step B, C e D:
+            . Note que nao está sendo executado nenhuma acao apenas declarando dataframes;
+            . Note o total de time de execucao no comando "for each";
+            . Note o resultado para "countFiles(...)":
+                . O total de registros;
+                . O total de arquivos;
+                . O total de diretorios;
+        . Step E, F e G para mais variaveis e como elas afetam o escaneamento:
+        . Step J, abra o Spark Ui e veja o "Query Details" do ultimo job:
+            . Identifique que a prova de scanning é a causa raiz do problema de performance;
+        . Resumo:
+            . Step B:
+                . Description: ~100 registros por arquivo particionado (tiny files)
+                . Duration: ~1 minuto
+                . Records: ~34,562,416
+                . Files: 345,612
+                . Directories: 1
+            . Step C:
+                . Description: Particionado por ano e mes
+                . Duracao: ~5 segundos
+                . Records: 36,152,970  
+                . Files: 6,273
+                . Diretorios: 12
+            . Step D:
+                . Description: Particionado por ano, mes, hora e dia
+                . Duracao: ~15 minutos
+                . Records: 37,413,338
+                . Files: 6,273
+                . Diretorios: 8,760
+            . Como podemos mitigar o problema de scanning:
+                . O que aconteceria se especificarmos o schema? Verifique o passo H e determine se essa solucao funciona
+                    . Nao resolveria o problema. 
+                . O que aconteceria se registrássemos como uma tabela? Consulte a etapa I e determine se esta solução funciona
+                    . Resolve o problema, mas é necessario gravar anteriormente como uma tabela (essa etapa pode levar mais tempo)'
+. Schemas                    
+    . Os esquemas de inferência (para Json e csv) exigem uma leitura completa do arquivo para determinar os tipos de dados, mesmo que você queira apenas um subconjunto dos dados;
+    . A leitura de arquivos Parquet requer uma leitura única do esquema;
+    . No entanto, o suporte à evolução do esquema é [potencialmente] caro:
+        . Se você tiver centenas a milhares de arquivos parciais, cada schema deve ser lido e depois mesclado, o que coletivamente pode ser bastante caro;
+        . A mesclagem de esquema foi desativada por padrão a partir do Spark 1.5
+        . Habilite através da opção de configuração 'spark.sql.parquet.mergeSchema' ou da opção mergeSchema;
+    . Existem várias maneiras de mitigar alguns desses problemas:
+        . Forneça o esquema sempre:
+            . Especialmente para JSON e CSV (Aplicável a Parquet e outros formatos);
+        . Usar tabelas - o metastore de apoio rastreará o esquema da tabela;
+        . Ou apenas use Delta:
+            . Zero leituras com meta store;
+            . No máximo uma leitura, mesmo com evolução do esquema;
+| Serialization
+    . A serialização é o último dos nossos "problemas mais comuns";
+    . O Spark 1.x forneceu ganhos significativos de desempenho em relação a outras soluções;
+    . Spark 2.x, ou seja, Spark SQL & a API DataFrames trouxe ainda mais ganhos de desempenho ao abstrair os planos de execução;
+    . Não escrevemos mais operações de "mapeamento" com código personalizado, mas expressamos nossas transformações com as APIs SQL e DataFrames;
+    . Isso significa que com o Spark 2.x, quando voltarmos ao código, veremos mais ocorrências de desempenho;
+    . Exemplo #5980:
+        . Step D-S e Step D-P
+        . Estes usam Lambda que nao faz nada e um leitura direta;
+        . A versao Scala leva < 15 minutos;
+        . A versao Python leva ~ 2.5 horas;
+        . Tudo porque executamos este código python lambda x: None;
+    . Exemplo #4538:
+        . Efeitos da serializacao em SCALA:
+            . Veja o Step D que usa funções higher-order: 1 - Uses functions from "org.apache.spark.sql.functions". 2 - Note o tempo de execucao;
+            . Veja o Step E que usa dois UDFs: 1 - Veja "parseId(..)" e "parseType(..)". 2 - Note o tempo de execucao;
+            . Veja o Step F que usa o tipo de transformacao: 1 - Veja a operacao "map(..)". 2 - Veja o tempo de execucao;
+            . Scala Overhead review:
+                . Step: C - Type: Baseline - Duration: ~ 3 min 
+                . Step: D - Type: Higher-order Functions - Duration ~ 25 min
+                . Step: E - Type: UDFs - Duration ~ 35 min
+                . Step: F - Type: Typed Transformations - Duration + 25 min             
+        . Efeitos da serializacao em PYTHON:
+            . Veja o Step D que usa funções higher-order: 1 - Uses functions from "pyspark.sql.functions". 2 - Note o tempo de execucao;
+            . Veja o Step E que usa dois UDFs: 1 - Veja "parseId(..)" e "parseType(..)". 2 - Note o tempo de execucao;
+            . Veja o Step F que usa Pandas UDFs: 1 - Veja @pandas_udf parseId(..) e @pandas_udf parseType(..). 2 - Note o tempo de execucao;
+            . Python Overhead review:
+                . Step C - Type: Baseline - Duration: ~ 3 min
+                . Step D - Type: Higher-order Functions - Duration: ~ 25 min
+                . Step E - Type: UDFs - Duration: ~ 105 min
+                . Step F - Type: Vectorized UDFs - Duration: > 70 min                      
+        . Por que ainda existem processos que utilizam os exemplos de baixo recurso de desempenho?
+            . Integração com bibliotecas de terceiros:
+                . Comum nas ciências de dados;
+                . Em alguns casos não há outra escolha;
+            . Tentar integrar com os frameworks existentes na empresa:
+                . por exemplo. objetos de negócios personalizados;
+                . ou bibliotecas proprietárias;
+            . Migrações de sistemas legados como Hadoop:
+                . Copie e cole o código em vez de reescrevê-lo como funções de ordem superior;
+    . O que podemos fazer para mitigar os problemas de serializacao?
+        . Resposta rapida, nao usa UDFs, vectorizes UDFs ou typed transformations;
+        . A necessidade desses recursos é muito rara;
+        . Mas se tiver necessidade:
+            . Use UDFs vetorizados sobre UDFs Python padrao;
+            . Use Typed Transformations sobre UDFs Scala padrao; 
